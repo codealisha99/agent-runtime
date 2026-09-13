@@ -1,15 +1,7 @@
 .venv/
-venv/
 __pycache__/
-*.py[cod]
-*$py.class
 .pytest_cache/
 .coverage
 htmlcov/
-.mypy_cache/
-.ruff_cache/
-.DS_Store
-node_modules/
-*.egg-info/
-dist/
-build/
+data/
+*.pyc
