@@ -1,0 +1,7 @@
+{
+  "name": "@ai-infra/agent-runtime",
+  "private": true,
+  "scripts": {
+    "test:unit": "pytest -q"
+  }
+}
