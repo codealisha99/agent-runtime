@@ -1,125 +1,309 @@
-"""AgentRuntime FastAPI — ToolMesh + GuardRail middleware."""
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
-import time
+"""AgentRuntime FastAPI — typed tools, grants, sandbox, guardrails."""
+from __future__ import annotations
 
-from ..tools.registry import register_tool, list_tools, execute_tool, grant, TOOLS, LOGS
-from ..guardrails.middleware import check_input, check_output, redact_pii, detect_pii, detect_injection
-from ..observability.otel import init_tracing, span, current_trace_id
+import logging
+from pathlib import Path
+from typing import Any, Optional
 
-init_tracing("agentruntime")
-app = FastAPI(title="AgentRuntime", version="1.0.0", description="ToolMesh + GuardRail — typed tools, sandboxed, permissioned, guarded")
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 
-@app.get("/health")
-def health(): return {"status":"ok","service":"agentruntime","tools":len(TOOLS)}
+from ..config import get_settings
+from ..guardrails.middleware import check_input, check_output, redact_pii, wrap_llm
+from ..llm.provider import LLMError, complete, plan_tool, probe
+from ..observability.otel import current_trace_id, init_tracing, span
+from ..tools import handlers
+from ..tools.registry import (
+    GRANTS,
+    LOGS,
+    TOOLS,
+    _redis,
+    execute_tool,
+    grant,
+    grants_for,
+    list_tools,
+    register_tool,
+)
 
-# ----- tools -----
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("agentruntime")
+
+settings = get_settings()
+init_tracing("agentruntime", settings.otel_endpoint)
+
+app = FastAPI(
+    title="AgentRuntime",
+    version="2.0.0",
+    description="Production runtime: typed tools, SMTP, live search, trained injection classifier, OpenAI/Ollama.",
+)
+
+DASHBOARD = Path(__file__).with_name("dashboard.html")
+
+
+def resolve_tenant(explicit: str | None, header_value: str | None) -> str:
+    return (header_value or explicit or "default").strip() or "default"
+
+
 class ToolRegister(BaseModel):
     name: str
     description: str
-    parameters: Dict[str, Any]
-    allowed_capabilities: List[str] = []
+    parameters: dict[str, Any]
+    allowed_capabilities: list[str] = []
+
+
+class ToolExec(BaseModel):
+    name: str
+    args: dict[str, Any] = {}
+    capabilities: list[str] = []
+    timeout: Optional[int] = None
+
+
+class GrantBody(BaseModel):
+    capabilities: list[str]
+    tenant_id: str = "default"
+
+
+class GuardCheck(BaseModel):
+    text: str = Field(..., max_length=16000)
+    policy: str = "block"
+    direction: str = "input"
+
+
+class RedactBody(BaseModel):
+    text: str = Field(..., max_length=16000)
+
+
+class ToolRequest(BaseModel):
+    name: str
+    args: dict[str, Any] = {}
+
+
+class AgentExec(BaseModel):
+    input: str = Field(..., max_length=16000)
+    tool_request: Optional[ToolRequest] = None
+    capabilities: list[str] = []
+    policy: str = "block"
+    tenant_id: str = "default"
+
+
+class WrapDemo(BaseModel):
+    prompt: str
+    policy: str = "block"
+
+
+def _checks() -> dict[str, Any]:
+    cfg = get_settings()
+    redis_client = _redis()
+    return {
+        "llm": probe(),
+        "smtp": {
+            "configured": bool(cfg.smtp_host),
+            "ok": True,
+            "from": cfg.smtp_from if cfg.smtp_host else None,
+        },
+        "search": {"provider": cfg.search_provider, "brave": bool(cfg.brave_api_key)},
+        "weather": {"provider": cfg.weather_provider},
+        "translate": {"provider": cfg.translate_provider},
+        "cache": {
+            "backend": "memory" if cfg.cache_backend == "memory" or not cfg.redis_url else "redis",
+            "ok": cfg.cache_backend == "memory" or redis_client is not None,
+        },
+        "injection": {"classifier": "naive_bayes", "threshold": cfg.injection_threshold},
+    }
+
+
+@app.get("/health")
+def health():
+    cfg = get_settings()
+    return {
+        "status": "ok",
+        "service": "agentruntime",
+        "version": "2.0.0",
+        "env": cfg.app_env,
+        "tools": len(TOOLS),
+        "grants": len(GRANTS),
+        "logs": len(LOGS),
+        "outbox": len(handlers.EMAIL_OUTBOX),
+        "llm": cfg.llm_provider,
+        "checks": _checks(),
+    }
+
+
+@app.get("/ready")
+def ready():
+    cfg = get_settings()
+    checks = _checks()
+    problems = []
+    if cfg.llm_provider == "openai" and not cfg.openai_api_key:
+        problems.append("OPENAI_API_KEY missing")
+    if cfg.cache_backend == "redis" and not checks["cache"]["ok"]:
+        problems.append("redis unavailable")
+    if problems and cfg.app_env == "production":
+        return JSONResponse({"status": "not_ready", "problems": problems, "checks": checks}, status_code=503)
+    return {"status": "ready", "problems": problems, "checks": checks}
+
 
 @app.post("/v1/tools/register")
 def post_register(body: ToolRegister):
-    # handler stub for dynamic register
-    def handler(**kwargs): return f"dynamic tool {body.name} called with {kwargs}"
+    def handler(**kwargs):
+        return {"tool": body.name, "args": kwargs, "dynamic": True}
+
     try:
-        t = register_tool(body.name, body.description, body.parameters, handler, body.allowed_capabilities)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    return {"tool": {"name": t["name"], "description": t["description"]}}
+        tool = register_tool(
+            body.name,
+            body.description,
+            body.parameters,
+            handler,
+            body.allowed_capabilities,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"tool": {"name": tool["name"], "description": tool["description"]}}
+
 
 @app.get("/v1/tools")
 def get_tools(q: Optional[str] = None):
     return {"tools": list_tools(q)}
 
-class ToolExec(BaseModel):
-    name: str
-    args: Dict[str, Any] = {}
-    capabilities: List[str] = []
-
-class GrantBody(BaseModel):
-    capabilities: List[str]
-    tenant_id: str = "default"
-
 
 @app.post("/v1/grants")
 def post_grants(body: GrantBody, x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-Id")):
-    tid = x_tenant_id or body.tenant_id
+    tid = resolve_tenant(body.tenant_id, x_tenant_id)
     return {"tenant_id": tid, "capabilities": grant(tid, body.capabilities)}
+
+
+@app.get("/v1/grants")
+def get_grants(x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-Id"), tenant_id: str = "default"):
+    tid = resolve_tenant(tenant_id, x_tenant_id)
+    caps = grants_for(tid)
+    return {"tenant_id": tid, "capabilities": caps or [], "granted": tid in GRANTS}
 
 
 @app.post("/v1/tools/execute")
 def post_execute(body: ToolExec, x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-Id")):
-    tid = x_tenant_id or "default"
+    tid = resolve_tenant(None, x_tenant_id)
     with span("agent.tool", tool=body.name, tenant_id=tid):
-        res = execute_tool(body.name, body.args, body.capabilities, tenant_id=tid)
+        res = execute_tool(body.name, body.args, body.capabilities, timeout=body.timeout, tenant_id=tid)
     if res.get("status", 200) >= 400:
-        raise HTTPException(res["status"], res.get("error","error"))
+        raise HTTPException(res["status"], res.get("error", "error"))
     res["trace_id"] = current_trace_id()
     return res
+
 
 @app.get("/v1/tools/logs")
 def get_logs(x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-Id")):
     items = LOGS[-20:]
     if x_tenant_id:
-        items = [l for l in LOGS if l.get("tenant_id") == x_tenant_id][-20:]
+        items = [row for row in LOGS if row.get("tenant_id") == x_tenant_id][-20:]
     return {"logs": items}
 
-# ----- guardrails -----
-class GuardCheck(BaseModel):
-    text: str
-    policy: str = "block"  # block|flag|transform
-    direction: str = "input"  # input|output
+
+@app.get("/v1/outbox")
+def get_outbox(x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-Id"), tenant_id: str = "default"):
+    tid = resolve_tenant(tenant_id, x_tenant_id)
+    return {"tenant_id": tid, "messages": handlers.outbox_for(tid)}
+
 
 @app.post("/v1/guardrails/check")
 def guard_check(body: GuardCheck):
     if body.direction == "output":
-        r = check_output(body.text)
+        result = check_output(body.text)
     else:
-        r = check_input(body.text, policy=body.policy)
-    return {"allowed": r.allowed, "reason": r.reason, "pii": r.pii, "injection": r.injection, "redacted": r.redacted_text}
+        result = check_input(body.text, policy=body.policy)
+    return {
+        "allowed": result.allowed,
+        "reason": result.reason,
+        "pii": result.pii,
+        "injection": result.injection,
+        "redacted": result.redacted_text,
+        "policy": result.policy,
+        "injection_score": result.injection_score,
+        "injection_source": result.injection_source,
+    }
+
 
 @app.post("/v1/guardrails/redact")
-def guard_redact(body: Dict[str, Any]):
-    text = body.get("text","")
-    redacted, findings = redact_pii(text)
+def guard_redact(body: RedactBody):
+    redacted, findings = redact_pii(body.text)
     return {"redacted": redacted, "findings": findings}
 
-# E2E: LLM -> tool -> guard
+
+@app.post("/v1/guardrails/wrap-demo")
+def guard_wrap(body: WrapDemo):
+    @wrap_llm
+    def llm(prompt: str) -> str:
+        return complete(prompt)
+
+    try:
+        output = llm(body.prompt, policy=body.policy)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    return {"ok": True, "output": output}
+
+
 @app.post("/v1/agent/execute")
-def agent_execute(body: Dict[str, Any]):
-    # body: {input: str, tool_request: {name, args}, capabilities: []}
-    inp = body.get("input","")
-    treq = body.get("tool_request")
-    caps = body.get("capabilities", [])
-    policy = body.get("policy","block")
-    # 1. input guard
-    in_guard = check_input(inp, policy=policy)
+def agent_execute(body: AgentExec, x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-Id")):
+    tid = resolve_tenant(body.tenant_id, x_tenant_id)
+    in_guard = check_input(body.input, policy=body.policy)
     if not in_guard.allowed:
         raise HTTPException(403, f"input blocked: {in_guard.reason}")
-    # 2. tool exec
-    if treq:
-        tres = execute_tool(treq.get("name",""), treq.get("args",{}), caps)
-        if tres.get("status",200) >= 400:
-            raise HTTPException(tres["status"], tres.get("error"))
-        result_text = str(tres.get("result",""))
-        # 3. output guard
-        out_guard = check_output(result_text)
-        return {"input_guard": {"allowed": in_guard.allowed, "redacted": in_guard.redacted_text}, "tool_result": tres, "output_guard": {"allowed": out_guard.allowed, "redacted": out_guard.redacted_text}}
-    return {"input_guard": {"allowed": in_guard.allowed, "redacted": in_guard.redacted_text}}
+
+    request = body.tool_request
+    planned = False
+    if request is None:
+        guessed = plan_tool(in_guard.redacted_text)
+        if guessed:
+            request = ToolRequest(**guessed)
+            planned = True
+
+    try:
+        plan_text = complete(
+            f"User: {in_guard.redacted_text}\nTool plan: {request.model_dump() if request else 'none'}"
+        )
+    except LLMError as exc:
+        raise HTTPException(502, f"llm failed: {exc}") from exc
+
+    if not request:
+        return {
+            "tenant_id": tid,
+            "input_guard": {"allowed": in_guard.allowed, "redacted": in_guard.redacted_text},
+            "planned": planned,
+            "answer": check_output(plan_text).redacted_text,
+            "trace_id": current_trace_id(),
+        }
+
+    with span("agent.execute", tool=request.name, tenant_id=tid):
+        tres = execute_tool(request.name, request.args, body.capabilities, tenant_id=tid)
+    if tres.get("status", 200) >= 400:
+        raise HTTPException(tres["status"], tres.get("error"))
+
+    result_text = tres.get("result")
+    if not isinstance(result_text, str):
+        result_text = str(result_text)
+    out_guard = check_output(result_text)
+    if not out_guard.allowed:
+        raise HTTPException(403, f"output blocked: {out_guard.reason}")
+
+    try:
+        answer = complete(
+            f"User asked: {in_guard.redacted_text}\nTool {request.name} returned: {out_guard.redacted_text}\nReply briefly."
+        )
+    except LLMError as exc:
+        raise HTTPException(502, f"llm failed: {exc}") from exc
+    final = check_output(answer)
+    return {
+        "tenant_id": tid,
+        "input_guard": {"allowed": in_guard.allowed, "redacted": in_guard.redacted_text},
+        "planned": planned,
+        "tool_result": tres,
+        "output_guard": {"allowed": out_guard.allowed, "redacted": out_guard.redacted_text},
+        "answer": final.redacted_text,
+        "trace_id": current_trace_id() or tres.get("trace_id"),
+    }
+
 
 @app.get("/", response_class=HTMLResponse)
 def dash():
-    return """<!doctype html><html><head><title>AgentRuntime</title>
-    <style>body{font-family:sans-serif;max-width:920px;margin:32px auto;padding:0 20px}
-    .card{border:1px solid #ddd;border-radius:8px;padding:16px;margin:12px 0} pre{background:#f6f6f6;padding:10px;white-space:pre-wrap}</style></head>
-    <body><h1>AgentRuntime</h1>
-    <p>ToolMesh (typed, permissioned, sandboxed) + GuardRail (PII, injection, policy)</p>
-    <div class="card"><h3>Registered tools</h3><pre id="tools">loading…</pre></div>
-    <p><a href="/docs">Swagger</a> · <a href="/health">/health</a> · <a href="/v1/tools">/v1/tools</a></p>
-    <script>fetch('/v1/tools').then(r=>r.json()).then(j=>{document.getElementById('tools').textContent=j.tools.map(t=>t.name).join('\\n');});</script>
-    </body></html>"""
+    return DASHBOARD.read_text(encoding="utf-8")
